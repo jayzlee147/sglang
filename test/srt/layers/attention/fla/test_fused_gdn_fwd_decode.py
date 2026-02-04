@@ -26,6 +26,10 @@ from sglang.srt.layers.attention.fla.fused_gdn_fwd_decode_gluon import (
 )
 import triton
 
+import os
+os.environ["TRITON_CACHE_DIR"] = "/home/sijieli2/triton_cache"
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+os.environ["USE_IR_LOC"] = "ttgir"
 
 def gdn_fwd_decode_ref(
     mixed_qkv: torch.Tensor,
@@ -98,12 +102,13 @@ def gdn_fwd_decode_ref(
 
 def get_copy_size(batch_size, head_dim, seqlen, conv_width, num_heads_v):
     return (
-        (batch_size * head_dim * num_heads_v * seqlen * 3  * conv_width * 2 # qkv + conv_states + conv_weights
+        (batch_size * head_dim * num_heads_v * seqlen * 2 * (3 * conv_width - 1) # qkv + conv_states + conv_weights load + conv_states store
         + batch_size * head_dim * seqlen * num_heads_v  # conv_bias
         + batch_size * num_heads_v * 4 # A_log + a + dt_bias + b
         ) * 2 # bf16
         + batch_size * num_heads_v * head_dim * head_dim # ssm_state
-        * 4 # fp32
+        * 4 * 2 # fp32 * load/store
+        + batch_size * num_heads_v * seqlen * head_dim # o store
     )
 
 class TestFusedGDNFwdDecode:
@@ -1166,7 +1171,7 @@ class TestGluonFusedGDNFwdDecode:
         
         # Warmup
         for _ in range(3):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v4(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],
@@ -1192,7 +1197,7 @@ class TestGluonFusedGDNFwdDecode:
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(num_iters):
-            _ = fused_gdn_fwd_decode_gluon(
+            _ = fused_gdn_fwd_decode_gluon_v4(
                 mixed_qkv=mixed_qkv,
                 conv_state=conv_state,
                 conv_weight=inputs["conv_weight"],
@@ -1673,36 +1678,40 @@ class TestGluonFusedGDNFwdDecodeV2:
             batch_size, key_dim, value_dim, num_heads_qk, num_heads_v, head_dim,
             seqlen, conv_width, device, dtype, has_bias
         )
-        
+        ssm_state_indices = inputs["ssm_state_indices"]
         # Clone inputs for each run
         inputs_ref = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         inputs_gluon_v2 = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
+        # inputs_ref["ssm_state"] = inputs_ref["ssm_state"][:, :, :, :head_dim]
+        # inputs_gluon_v2["ssm_state"] = inputs_gluon_v2["ssm_state"][:, :, :, :head_dim]
+
         # Run reference implementation
         output_ref = gdn_fwd_decode_ref(**inputs_ref)
-        conv_state_ref = inputs_ref["conv_state"][:,:512,:]
-        ssm_state_ref = inputs_ref["ssm_state"]
+        conv_state_ref = inputs_ref["conv_state"]
+        ssm_state_ref = inputs_ref["ssm_state"][0,:,:,:]
         
         print("gdn_fwd_decode_ref @@@@@@@@@@@@@ fused_gdn_fwd_decode_gluon_v2")
 
         # Run Gluon v2 implementation
         output_gluon_v2 = fused_gdn_fwd_decode_gluon_v6(**inputs_gluon_v2)
-        conv_state_gluon_v2 = inputs_gluon_v2["conv_state"][:,:512,:]
-        ssm_state_gluon_v2 = inputs_gluon_v2["ssm_state"]
+        conv_state_gluon_v2 = inputs_gluon_v2["conv_state"]
+        ssm_state_gluon_v2 = inputs_gluon_v2["ssm_state"][0,:,:,:]
 
-        # print(f"{conv_state_gluon_v2.shape=}\n{conv_state_ref.shape=}")
-        # print(f"{conv_state_gluon_v2=}\n{conv_state_ref=}")
+        print(f"{output_gluon_v2.shape=}\n{output_ref.shape=}")
+        print(f"{output_gluon_v2=}\n{output_ref=}")
+        print(f"{conv_state_gluon_v2.shape=}\n{conv_state_ref.shape=}")
+        # print(f"{inputs["conv_state_indices"]=}\n{conv_state_gluon_v2=}\n{conv_state_ref=}")
 
-        # print(f"{ssm_state_ref.shape=}\n{ssm_state_gluon_v2.shape=}")
-        # print(f"{ssm_state_ref=}\n{ssm_state_gluon_v2=}")
+        print(f"{ssm_state_ref.shape=},{ssm_state_ref.stride()=}\n{ssm_state_gluon_v2.shape=},{ssm_state_gluon_v2.stride()=}")
+        print(f"{ssm_state_indices=}\n{ssm_state_ref=}\n{ssm_state_gluon_v2=}")
 
         rtol, atol = 1e-2, 5e-2
         # Compare conv_states
         torch.testing.assert_close(conv_state_gluon_v2, conv_state_ref, rtol=rtol, atol=atol)
         torch.testing.assert_close(ssm_state_gluon_v2, ssm_state_ref, rtol=rtol, atol=atol)
         # Compare outputs
-        torch.testing.assert_close(output_gluon_v2, output_ref, rtol=rtol, atol=atol)
-        
+        torch.testing.assert_close(output_gluon_v2, output_ref, rtol=rtol, atol=atol)  
         print(f"✓ Gluon v2 vs reference test passed (batch={batch_size}, seqlen={seqlen})")
     
     @pytest.mark.parametrize("batch_size", [1, 4])
